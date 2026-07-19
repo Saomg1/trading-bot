@@ -923,13 +923,14 @@ async def activate_promo_command(message: Message):
 
 @router.message(Command("set_vip"))
 async def make_me_vip(message: Message):
-    # Код проверяет, твой ли это Telegram ID
-    # Если ты уверен, что ID 761772286 правильный, оставь как есть
-    if message.from_user.id != 761772286:
-        await message.answer("У вас нет прав администратора.")
+    # Добавим вывод в консоль Railway
+    print(f"DEBUG: Попытка админ-команды от ID: {message.from_user.id}, Тип ID: {type(message.from_user.id)}")
+    
+    # Сравним жестко
+    if int(message.from_user.id) != 761772286:
+        await message.answer(f"❌ Нет прав. Ваш ID: {message.from_user.id}")
         return 
     
-    # Активируем VIP через твою функцию из db.py
     await db.activate_subscription(message.from_user.id, "vip", 365)
     await message.answer("✅ Статус VIP активирован на 365 дней!")
 
