@@ -927,7 +927,7 @@ async def make_me_vip(message: Message):
     print(f"DEBUG: Попытка админ-команды от ID: {message.from_user.id}, Тип ID: {type(message.from_user.id)}")
     
     # Сравним жестко
-    if int(message.from_user.id) != 761772286:
+    if int(message.from_user.id) != 7617722286:
         await message.answer(f"❌ Нет прав. Ваш ID: {message.from_user.id}")
         return 
     
