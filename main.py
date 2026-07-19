@@ -919,6 +919,19 @@ async def activate_promo_command(message: Message):
         # Активируем подписку (функция activate_subscription у тебя есть в db.py)
         await db.activate_subscription(message.from_user.id, promo['plan'], promo['days'])
         await message.answer(f"✅ Успешно! Подписка {promo['plan']} на {promo['days']} дней активирована.")
+        # Эту часть вставь в конец файла main.py
+
+@router.message(Command("set_vip"))
+async def make_me_vip(message: Message):
+    # Код проверяет, твой ли это Telegram ID
+    # Если ты уверен, что ID 761772286 правильный, оставь как есть
+    if message.from_user.id != 761772286:
+        await message.answer("У вас нет прав администратора.")
+        return 
+    
+    # Активируем VIP через твою функцию из db.py
+    await db.activate_subscription(message.from_user.id, "vip", 365)
+    await message.answer("✅ Статус VIP активирован на 365 дней!")
 
 if __name__ == "__main__":
     print("🚀 Apex Trading Terminal запущен!")
