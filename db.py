@@ -1,7 +1,3 @@
-Бд 
-
-
-
 import aiosqlite
 import time
 from datetime import datetime, timezone
