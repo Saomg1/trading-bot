@@ -1,0 +1,1565 @@
+# import aiosqlite
+# import time
+# from datetime import datetime, timezone
+# from cryptography.fernet import Fernet
+# import os
+
+# DATABASE_PATH  = os.environ.get("DATABASE_PATH", "apex_trading.db")
+# ENCRYPTION_KEY = b"Yhq8azrWaoaC7tPY1hLuUbwBTFa0U8QCRE8oWwoVmR0="
+# fernet         = Fernet(ENCRYPTION_KEY)
+
+# PLANS = {
+#     "basic": {"name": "Basic", "emoji": "🥉", "price": 29,  "days": 30, "signal_limit": 5,    "auto_trade": False, "entry_only": False, "daily_report": False},
+#     "pro":   {"name": "Pro",   "emoji": "🥈", "price": 69,  "days": 30, "signal_limit": 9999, "auto_trade": True,  "entry_only": True,  "daily_report": False},
+#     "vip":   {"name": "VIP",   "emoji": "👑", "price": 129, "days": 30, "signal_limit": 9999, "auto_trade": True,  "entry_only": False, "daily_report": True},
+# }
+
+# async def init_db():
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.executescript("""
+#             CREATE TABLE IF NOT EXISTS users (
+#                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                 telegram_id INTEGER UNIQUE NOT NULL,
+#                 username TEXT,
+#                 first_name TEXT,
+#                 language TEXT DEFAULT 'ru',
+#                 subscription TEXT DEFAULT NULL,
+#                 sub_expires INTEGER DEFAULT 0,
+#                 api_key_enc BLOB DEFAULT NULL,
+#                 api_secret_enc BLOB DEFAULT NULL,
+#                 bingx_connected INTEGER DEFAULT 0,
+#                 signals_today INTEGER DEFAULT 0,
+#                 signals_date TEXT DEFAULT '',
+#                 trades_today INTEGER DEFAULT 0,
+#                 trades_date TEXT DEFAULT '',
+#                 daily_trade_limit INTEGER DEFAULT 0,
+#                 balance REAL DEFAULT 0,
+#                 created_at INTEGER DEFAULT 0
+#             );
+#             CREATE TABLE IF NOT EXISTS payments (
+#                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                 telegram_id INTEGER NOT NULL,
+#                 plan TEXT NOT NULL,
+#                 amount REAL NOT NULL,
+#                 tx_hash TEXT UNIQUE NOT NULL,
+#                 status TEXT DEFAULT 'pending',
+#                 created_at INTEGER DEFAULT 0,
+#                 verified_at INTEGER DEFAULT 0
+#             );
+#             CREATE TABLE IF NOT EXISTS trades (
+#                 id INTEGER PRIMARY KEY AUTOINCREMENT,
+#                 telegram_id INTEGER NOT NULL,
+#                 symbol TEXT NOT NULL,
+#                 side TEXT NOT NULL,
+#                 entry_price REAL,
+#                 sl REAL, tp1 REAL, tp2 REAL,
+#                 amount_usdt REAL,
+#                 bingx_order_id TEXT DEFAULT NULL,
+#                 status TEXT DEFAULT 'pending',
+#                 created_at INTEGER DEFAULT 0
+#             );
+#         """)
+#         await db.commit()
+
+# # ── Users ──────────────────────────────────────────────────────────────────────
+
+# async def get_user(telegram_id: int):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM users WHERE telegram_id=?", (telegram_id,)) as cur:
+#             row = await cur.fetchone()
+#             return dict(row) if row else None
+
+# async def upsert_user(telegram_id: int, username, first_name):
+#     now = int(time.time())
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             """INSERT INTO users (telegram_id, username, first_name, created_at)
+#                VALUES (?,?,?,?)
+#                ON CONFLICT(telegram_id) DO UPDATE SET username=excluded.username, first_name=excluded.first_name""",
+#             (telegram_id, username, first_name, now))
+#         await db.commit()
+
+# async def set_language(telegram_id: int, lang: str):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute("UPDATE users SET language=? WHERE telegram_id=?", (lang, telegram_id))
+#         await db.commit()
+
+# async def get_language(telegram_id: int) -> str:
+#     user = await get_user(telegram_id)
+#     return user["language"] if user else "ru"
+
+# async def get_user_by_username(username: str):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM users WHERE username=?", (username,)) as cur:
+#             row = await cur.fetchone()
+#             return dict(row) if row else None
+
+# # ── Subscription ───────────────────────────────────────────────────────────────
+
+# async def activate_subscription(telegram_id: int, plan: str, days: int = 30):
+#     now = int(time.time())
+#     user = await get_user(telegram_id)
+#     base = user["sub_expires"] if user and user["sub_expires"] > now else now
+#     new_exp = base + days * 86400
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET subscription=?, sub_expires=? WHERE telegram_id=?",
+#             (plan, new_exp, telegram_id))
+#         await db.commit()
+
+# async def get_subscription(telegram_id: int):
+#     user = await get_user(telegram_id)
+#     if not user:
+#         return None, 0
+#     now = int(time.time())
+#     if user["sub_expires"] and user["sub_expires"] > now:
+#         return user["subscription"], user["sub_expires"]
+#     return None, 0
+
+# async def has_active_sub(telegram_id: int) -> bool:
+#     plan, _ = await get_subscription(telegram_id)
+#     return plan is not None
+
+# # ── Signals ────────────────────────────────────────────────────────────────────
+
+# async def check_signal_quota(telegram_id: int, daily_limit: int) -> bool:
+#     if daily_limit >= 9999:
+#         return True
+#     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+#     user = await get_user(telegram_id)
+#     if not user:
+#         return False
+#     if user.get("signals_date") != today:
+#         return True
+#     return user.get("signals_today", 0) < daily_limit
+
+# async def increment_signal_count(telegram_id: int):
+#     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+#     user = await get_user(telegram_id)
+#     if not user:
+#         return
+#     if user.get("signals_date") != today:
+#         count = 1
+#     else:
+#         count = user.get("signals_today", 0) + 1
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET signals_today=?, signals_date=? WHERE telegram_id=?",
+#             (count, today, telegram_id))
+#         await db.commit()
+
+# # ── Trades quota ───────────────────────────────────────────────────────────────
+
+# async def check_trade_quota(telegram_id: int) -> bool:
+#     user = await get_user(telegram_id)
+#     if not user:
+#         return False
+#     limit = user.get("daily_trade_limit", 0)
+#     if limit == 0:
+#         return True
+#     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+#     if user.get("trades_date") != today:
+#         return True
+#     return user.get("trades_today", 0) < limit
+
+# async def increment_trade_count(telegram_id: int):
+#     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+#     user = await get_user(telegram_id)
+#     if not user:
+#         return
+#     if user.get("trades_date") != today:
+#         count = 1
+#     else:
+#         count = user.get("trades_today", 0) + 1
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET trades_today=?, trades_date=? WHERE telegram_id=?",
+#             (count, today, telegram_id))
+#         await db.commit()
+
+# async def set_trade_limit(telegram_id: int, limit: int):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET daily_trade_limit=? WHERE telegram_id=?",
+#             (limit, telegram_id))
+#         await db.commit()
+
+# async def get_trade_limit(telegram_id: int) -> int:
+#     user = await get_user(telegram_id)
+#     return user.get("daily_trade_limit", 0) if user else 0
+
+# # ── API Keys ───────────────────────────────────────────────────────────────────
+
+# async def save_api_keys(telegram_id: int, api_key: str, secret: str):
+#     enc_key = fernet.encrypt(api_key.encode())
+#     enc_sec = fernet.encrypt(secret.encode())
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET api_key_enc=?, api_secret_enc=?, bingx_connected=1 WHERE telegram_id=?",
+#             (enc_key, enc_sec, telegram_id))
+#         await db.commit()
+
+# async def get_api_keys(telegram_id: int):
+#     user = await get_user(telegram_id)
+#     if not user or not user.get("api_key_enc"):
+#         return None, None
+#     try:
+#         key = fernet.decrypt(user["api_key_enc"]).decode()
+#         sec = fernet.decrypt(user["api_secret_enc"]).decode()
+#         return key, sec
+#     except Exception:
+#         return None, None
+
+# async def remove_api_keys(telegram_id: int):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE users SET api_key_enc=NULL, api_secret_enc=NULL, bingx_connected=0 WHERE telegram_id=?",
+#             (telegram_id,))
+#         await db.commit()
+
+# # ── Payments ───────────────────────────────────────────────────────────────────
+
+# async def create_payment(telegram_id: int, plan: str, amount: float, tx_hash: str):
+#     now = int(time.time())
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "INSERT OR IGNORE INTO payments (telegram_id, plan, amount, tx_hash, status, created_at) VALUES (?,?,?,?,?,?)",
+#             (telegram_id, plan, amount, tx_hash, "pending", now))
+#         await db.commit()
+
+# async def get_payment_by_hash(tx_hash: str):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM payments WHERE tx_hash=?", (tx_hash,)) as cur:
+#             row = await cur.fetchone()
+#             return dict(row) if row else None
+
+# async def update_payment_status(tx_hash: str, status: str):
+#     now = int(time.time())
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE payments SET status=?, verified_at=? WHERE tx_hash=?",
+#             (status, now, tx_hash))
+#         await db.commit()
+
+# # ── Trades ─────────────────────────────────────────────────────────────────────
+
+# async def create_trade(telegram_id: int, symbol: str, side: str,
+#                        entry: float, sl: float, tp1: float, tp2: float, amount: float) -> int:
+#     now = int(time.time())
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         cur = await db.execute(
+#             """INSERT INTO trades (telegram_id, symbol, side, entry_price, sl, tp1, tp2,
+#                amount_usdt, status, created_at) VALUES (?,?,?,?,?,?,?,?,?,?)""",
+#             (telegram_id, symbol, side, entry, sl, tp1, tp2, amount, "pending", now))
+#         await db.commit()
+#         return cur.lastrowid
+
+# async def get_trade(trade_id: int):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM trades WHERE id=?", (trade_id,)) as cur:
+#             row = await cur.fetchone()
+#             return dict(row) if row else None
+
+# async def update_trade(trade_id: int, order_id: str, status: str):
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         await db.execute(
+#             "UPDATE trades SET bingx_order_id=?, status=? WHERE id=?",
+#             (order_id, status, trade_id))
+#         await db.commit()
+
+# # ── Stats ──────────────────────────────────────────────────────────────────────
+
+# async def get_stats() -> dict:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         now = int(time.time())
+#         async with db.execute("SELECT COUNT(*) as c FROM users") as cur:
+#             total = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM users WHERE sub_expires>?", (now,)) as cur:
+#             active = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT subscription, COUNT(*) as c FROM users WHERE sub_expires>? GROUP BY subscription", (now,)) as cur:
+#             rows = await cur.fetchall()
+#         plans = {r["subscription"]: r["c"] for r in rows if r["subscription"]}
+#         async with db.execute("SELECT SUM(amount) as s FROM payments WHERE status='verified'") as cur:
+#             rev = (await cur.fetchone())["s"] or 0
+#     return {"total": total, "active": active, "plans": plans, "revenue": rev}
+
+# async def get_advanced_stats() -> dict:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+#         async with db.execute("SELECT COUNT(*) as c FROM payments") as cur:
+#             pt = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM payments WHERE status='verified'") as cur:
+#             po = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM payments WHERE status='failed'") as cur:
+#             pf = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM trades") as cur:
+#             tt = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM trades WHERE status='open'") as cur:
+#             to_ = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM trades WHERE status='error'") as cur:
+#             te = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT COUNT(*) as c FROM users WHERE bingx_connected=1") as cur:
+#             api = (await cur.fetchone())["c"]
+#         async with db.execute("SELECT SUM(signals_today) as s FROM users WHERE signals_date=?", (today,)) as cur:
+#             sig = (await cur.fetchone())["s"] or 0
+#     return {"payments_total": pt, "payments_ok": po, "payments_fail": pf,
+#             "trades_total": tt, "trades_open": to_, "trades_err": te,
+#             "api_connected": api, "signals_today": sig}
+
+# async def get_recent_users(limit: int = 10) -> list:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM users ORDER BY created_at DESC LIMIT ?", (limit,)) as cur:
+#             rows = await cur.fetchall()
+#             return [dict(r) for r in rows]
+
+# async def get_recent_payments(limit: int = 10) -> list:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM payments ORDER BY created_at DESC LIMIT ?", (limit,)) as cur:
+#             rows = await cur.fetchall()
+#             return [dict(r) for r in rows]
+
+# async def get_recent_trades(limit: int = 10) -> list:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         async with db.execute("SELECT * FROM trades ORDER BY created_at DESC LIMIT ?", (limit,)) as cur:
+#             rows = await cur.fetchall()
+#             return [dict(r) for r in rows]
+
+# async def get_vip_with_api() -> list:
+#     async with aiosqlite.connect(DATABASE_PATH) as db:
+#         db.row_factory = aiosqlite.Row
+#         now = int(time.time())
+#         async with db.execute(
+#             "SELECT * FROM users WHERE subscription='vip' AND sub_expires>? AND bingx_connected=1",
+#             (now,)) as cur:
+#             rows = await cur.fetchall()
+#             return [dict(r) for r in rows] 
+        
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#         from dotenv import load_dotenv
+# load_dotenv()
+
+# """Apex Trading Bot — всё в одном файле."""
+# import asyncio
+# import hashlib
+# import hmac
+# import logging
+# import os
+# import sys
+# import time
+# from datetime import datetime, timezone
+
+# import httpx
+# from aiogram import Bot, Dispatcher, Router, F
+# from aiogram.client.default import DefaultBotProperties
+# from aiogram.enums import ParseMode
+# from aiogram.filters import Command, CommandStart
+# from aiogram.fsm.context import FSMContext
+# from aiogram.fsm.state import State, StatesGroup
+# from aiogram.fsm.storage.memory import MemoryStorage
+# from aiogram.types import (
+#     BotCommand, CallbackQuery, InlineKeyboardButton,
+#     InlineKeyboardMarkup, Message
+# )
+# from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+# import db
+# from db import PLANS
+
+# logging.basicConfig(level=logging.INFO, stream=sys.stdout)
+# logger = logging.getLogger(__name__)
+
+# BOT_TOKEN = os.environ["8873605360:AAEAyvAVfjWwnBqafyAhU7Tcewr0W1dUMIs"]
+# ADMIN_ID         = int(os.environ.get("ADMIN_ID", "7617722286"))
+# WALLET_ADDRESS   = os.environ.get("WALLET_ADDRESS", "TVKM9eHD8iicCKk5tZNa5pajcmdJH9adJd")
+# BINGX_BASE       = "https://open-api.bingx.com"
+# TRONSCAN_API     = "https://apilist.tronscanapi.com/api"
+# USDT_CONTRACT    = "TR7NHqjeKQxGTCi8q8ZY4pL8otSzgjLj6t"
+
+# bot    = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+# dp     = Dispatcher(storage=MemoryStorage())
+# router = Router()
+# dp.include_router(router)
+
+# class PayFSM(StatesGroup):
+#     waiting_tx = State()
+
+# class SignalFSM(StatesGroup):
+#     waiting_pair = State()
+
+# class ApiFSM(StatesGroup):
+#     waiting_key    = State()
+#     waiting_secret = State()
+
+# # ── Клавиатуры ─────────────────────────────────────────────────────────────────
+
+# def kb_lang() -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="🇷🇺 Русский", callback_data="lang:ru")
+#     b.button(text="🇺🇸 English", callback_data="lang:en")
+#     b.adjust(2)
+#     return b.as_markup()
+
+# def kb_menu(lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     if lang == "ru":
+#         b.button(text="📊 Получить сигнал", callback_data="m:signal")
+#         b.button(text="💎 Подписка",        callback_data="m:sub")
+#         b.button(text="🤖 Авто-торговля",   callback_data="m:auto")
+#         b.button(text="👤 Профиль",         callback_data="m:profile")
+#         b.button(text="ℹ️ Помощь",          callback_data="m:help")
+#     else:
+#         b.button(text="📊 Get Signal",      callback_data="m:signal")
+#         b.button(text="💎 Subscription",    callback_data="m:sub")
+#         b.button(text="🤖 Auto-Trading",    callback_data="m:auto")
+#         b.button(text="👤 Profile",         callback_data="m:profile")
+#         b.button(text="ℹ️ Help",            callback_data="m:help")
+#     b.adjust(2, 2, 1)
+#     return b.as_markup()
+
+# def kb_plans(lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     mo = "мес" if lang == "ru" else "mo"
+#     b.button(text=f"🥉 Basic — 29 USDT/{mo}",          callback_data="plan:basic")
+#     b.button(text=f"🥈 Pro — 69 USDT/{mo} (вход▶️)",   callback_data="plan:pro")
+#     b.button(text=f"👑 VIP — 129 USDT/{mo}",            callback_data="plan:vip")
+#     b.button(text="⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="m:back")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# def kb_plan_buy(plan: str, lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="💳 Оплатить" if lang == "ru" else "💳 Pay Now", callback_data=f"buy:{plan}")
+#     b.button(text="⬅️ Назад"   if lang == "ru" else "⬅️ Back",    callback_data="m:sub")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# def kb_paid(lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="✅ Я оплатил — проверить" if lang == "ru" else "✅ I paid — verify",
+#              callback_data="pay:check")
+#     b.button(text="⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="m:sub")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# def kb_pairs(lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     for p in ["BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT", "XRP-USDT", "DOGE-USDT"]:
+#         b.button(text=p, callback_data=f"sig:{p}")
+#     b.button(text="✏️ Другая пара" if lang == "ru" else "✏️ Other pair", callback_data="sig:custom")
+#     b.button(text="⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="m:back")
+#     b.adjust(2, 2, 2, 1, 1)
+#     return b.as_markup()
+
+# def kb_api(lang: str, connected: bool) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     if connected:
+#         b.button(text="🔑 Изменить ключи" if lang == "ru" else "🔑 Update Keys",  callback_data="api:connect")
+#         b.button(text="❌ Отключить API"   if lang == "ru" else "❌ Disconnect",   callback_data="api:disc")
+#         b.button(text="💰 Баланс BingX"   if lang == "ru" else "💰 BingX Balance", callback_data="api:balance")
+#     else:
+#         b.button(text="🔑 Подключить BingX" if lang == "ru" else "🔑 Connect BingX", callback_data="api:connect")
+#     b.button(text="⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="m:back")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# def kb_trade_confirm(trade_id: int, lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="✅ Подтвердить" if lang == "ru" else "✅ Confirm", callback_data=f"tr:ok:{trade_id}")
+#     b.button(text="❌ Отменить"    if lang == "ru" else "❌ Cancel",  callback_data=f"tr:no:{trade_id}")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# def kb_back(lang: str) -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="⬅️ Назад" if lang == "ru" else "⬅️ Back", callback_data="m:back")
+#     return b.as_markup()
+
+# def kb_admin() -> InlineKeyboardMarkup:
+#     b = InlineKeyboardBuilder()
+#     b.button(text="📊 Полный отчёт",  callback_data="admin:report")
+#     b.button(text="👥 Пользователи",  callback_data="admin:users")
+#     b.button(text="💰 Платежи",       callback_data="admin:payments")
+#     b.button(text="📡 Сделки",        callback_data="admin:trades")
+#     b.adjust(1)
+#     return b.as_markup()
+
+# # ── Тексты ─────────────────────────────────────────────────────────────────────
+
+# def T(lang: str, key: str, **kw) -> str:
+#     txt = _TX.get(key, {}).get(lang) or _TX.get(key, {}).get("ru") or key
+#     return txt.format(**kw) if kw else txt
+
+# _TX = {
+#     "welcome": {
+#         "ru": "👋 Привет, <b>{name}</b>!\n\n🚀 <b>Apex Trading Bot</b> — ваш помощник для торговли на BingX.\n\n📊 Сигналы · 🤖 Авто-торговля · 💎 Подписки\n\nВыберите язык / Choose language:",
+#         "en": "👋 Hello, <b>{name}</b>!\n\n🚀 <b>Apex Trading Bot</b> — your BingX trading assistant.\n\n📊 Signals · 🤖 Auto-Trading · 💎 Subscriptions\n\nChoose language / Выберите язык:",
+#     },
+#     "menu": {
+#         "ru": "📋 <b>Главное меню</b>\n\nВыберите раздел:",
+#         "en": "📋 <b>Main Menu</b>\n\nChoose a section:",
+#     },
+#     "plans": {
+#         "ru": (
+#             "💎 <b>Тарифные планы Apex Trading</b>\n\n"
+#             "🥉 <b>Basic — 29 USDT/мес</b>\n• До 5 сигналов в день\n\n"
+#             "🥈 <b>Pro — 69 USDT/мес</b>\n• Безлимитные сигналы\n• Авто-ВХОД ▶️ (выход — вручную)\n\n"
+#             "👑 <b>VIP — 129 USDT/мес</b>\n• Авто-ВХОД + авто-ВЫХОД (TP/SL)\n• Свой лимит сделок\n• Ежедневные отчёты\n\nВыберите тариф:"
+#         ),
+#         "en": (
+#             "💎 <b>Apex Trading Plans</b>\n\n"
+#             "🥉 <b>Basic — 29 USDT/mo</b>\n• Up to 5 signals/day\n\n"
+#             "🥈 <b>Pro — 69 USDT/mo</b>\n• Unlimited signals\n• Auto-ENTRY ▶️ (exit manually)\n\n"
+#             "👑 <b>VIP — 129 USDT/mo</b>\n• Auto-ENTRY + auto-EXIT (TP/SL)\n• Custom trade limit\n• Daily reports\n\nChoose a plan:"
+#         ),
+#     },
+#     "plan_basic": {
+#         "ru": "🥉 <b>Basic — 29 USDT/мес</b>\n\n✅ До 5 сигналов в день\n✅ Зона входа, TP1, TP2, Stop-Loss\n✅ Уровень уверенности\n❌ Авто-торговля\n❌ Ежедневные отчёты",
+#         "en": "🥉 <b>Basic — 29 USDT/mo</b>\n\n✅ Up to 5 signals per day\n✅ Entry zone, TP1, TP2, Stop-Loss\n✅ Confidence level\n❌ Auto-trading\n❌ Daily reports",
+#     },
+#     "plan_pro": {
+#         "ru": (
+#             "🥈 <b>Pro — 69 USDT/мес</b>\n\n"
+#             "✅ Безлимитные сигналы + объяснения\n"
+#             "✅ Авто-ВХОД в сделку ▶️\n"
+#             "⚠️ <b>Выход — только вручную!</b>\n"
+#             "   (бот покажет SL/TP, закрыть сам)\n"
+#             "❌ Авто-выход по TP/SL\n"
+#             "❌ Ежедневные отчёты"
+#         ),
+#         "en": (
+#             "🥈 <b>Pro — 69 USDT/mo</b>\n\n"
+#             "✅ Unlimited signals + explanations\n"
+#             "✅ Auto-ENTRY into trade ▶️\n"
+#             "⚠️ <b>Exit manually only!</b>\n"
+#             "   (bot shows SL/TP, you close it)\n"
+#             "❌ Auto-exit by TP/SL\n"
+#             "❌ Daily reports"
+#         ),
+#     },
+#     "plan_vip": {
+#         "ru": (
+#             "👑 <b>VIP — 129 USDT/мес</b>\n\n"
+#             "✅ Безлимитные сигналы + объяснения\n"
+#             "✅ Авто-ВХОД ▶️ + авто-ВЫХОД ⏹️ (TP/SL)\n"
+#             "✅ Свой лимит сделок в день (/setlimit)\n"
+#             "✅ Ежедневные отчёты по портфелю\n"
+#             "✅ VIP-поддержка 24/7"
+#         ),
+#         "en": (
+#             "👑 <b>VIP — 129 USDT/mo</b>\n\n"
+#             "✅ Unlimited signals + explanations\n"
+#             "✅ Auto-ENTRY ▶️ + auto-EXIT ⏹️ (TP/SL)\n"
+#             "✅ Custom daily trade limit (/setlimit)\n"
+#             "✅ Daily portfolio reports\n"
+#             "✅ VIP support 24/7"
+#         ),
+#     },
+#     "payment": {
+#         "ru": (
+#             "💳 <b>Оплата {plan} — {price} USDT</b>\n\n"
+#             "1️⃣ Переведите ровно <b>{price} USDT (TRC20)</b> на:\n<code>{wallet}</code>\n\n"
+#             "2️⃣ Нажмите «Я оплатил — проверить»\n"
+#             "3️⃣ Вставьте TX hash транзакции\n\n"
+#             "⚠️ Только USDT TRC20 (сеть TRON)!\n⏱ Подтверждение: 1–5 минут"
+#         ),
+#         "en": (
+#             "💳 <b>Payment {plan} — {price} USDT</b>\n\n"
+#             "1️⃣ Send exactly <b>{price} USDT (TRC20)</b> to:\n<code>{wallet}</code>\n\n"
+#             "2️⃣ Press 'I paid — verify'\n"
+#             "3️⃣ Paste your TX hash\n\n"
+#             "⚠️ USDT TRC20 (TRON network) only!\n⏱ Confirmation: 1–5 minutes"
+#         ),
+#     },
+#     "enter_tx":    {"ru": "🔍 Введите TX hash вашей транзакции:", "en": "🔍 Enter the TX hash of your transaction:"},
+#     "verifying":   {"ru": "⏳ Проверяем транзакцию...",            "en": "⏳ Verifying transaction..."},
+#     "pay_ok": {
+#         "ru": "🎉 <b>Подписка {plan} активирована!</b>\n\n✅ Оплата: {amount} USDT\n📅 Действует до: {exp}\n\nДобро пожаловать! 🚀",
+#         "en": "🎉 <b>{plan} subscription activated!</b>\n\n✅ Payment: {amount} USDT\n📅 Valid until: {exp}\n\nWelcome! 🚀",
+#     },
+#     "pay_fail":    {"ru": "❌ <b>Ошибка:</b> {err}\n\nПопробуйте позже.", "en": "❌ <b>Error:</b> {err}\n\nTry again later."},
+#     "tx_dup":      {"ru": "⚠️ Этот TX hash уже использован.", "en": "⚠️ This TX hash has already been used."},
+#     "no_sub":      {"ru": "🔒 Требуется подписка.\n\nОформите её в разделе «Подписка».", "en": "🔒 Subscription required.\n\nGet one in the 'Subscription' section."},
+#     "sig_limit":   {"ru": "⚠️ Лимит 5 сигналов в день (Basic).\n\nОбновитесь до Pro/VIP.", "en": "⚠️ 5 signals/day limit (Basic).\n\nUpgrade to Pro/VIP."},
+#     "sig_menu":    {"ru": "📊 <b>Торговые сигналы</b>\n\nВыберите пару или введите свою:", "en": "📊 <b>Trading Signals</b>\n\nChoose a pair or enter your own:"},
+#     "enter_pair":  {"ru": "✏️ Введите пару (например: <code>SOL-USDT</code>):", "en": "✏️ Enter a pair (e.g. <code>SOL-USDT</code>):"},
+#     "loading_sig": {"ru": "📡 Анализирую {symbol}...", "en": "📡 Analyzing {symbol}..."},
+#     "sig_error":   {"ru": "❌ Не удалось получить данные по <b>{symbol}</b>.\n\nПроверьте название пары.", "en": "❌ Could not fetch data for <b>{symbol}</b>.\n\nCheck the pair name."},
+#     "api_intro": {
+#         "ru": (
+#             "🔑 <b>Подключение BingX API</b>\n\n"
+#             "1. bingx.com → Аккаунт → API Management\n"
+#             "2. Create API Key\n"
+#             "3. Разрешения: <b>Trade, Read</b> (без Withdraw!)\n\n"
+#             "Введите <b>API Key</b>:"
+#         ),
+#         "en": (
+#             "🔑 <b>Connect BingX API</b>\n\n"
+#             "1. bingx.com → Account → API Management\n"
+#             "2. Create API Key\n"
+#             "3. Permissions: <b>Trade, Read</b> (no Withdraw!)\n\n"
+#             "Enter your <b>API Key</b>:"
+#         ),
+#     },
+#     "enter_secret": {"ru": "Теперь введите <b>API Secret</b>:", "en": "Now enter your <b>API Secret</b>:"},
+#     "api_ok":       {"ru": "✅ BingX API подключён!\n💰 Баланс: <b>{bal:.2f} USDT</b>", "en": "✅ BingX API connected!\n💰 Balance: <b>{bal:.2f} USDT</b>"},
+#     "api_err":      {"ru": "❌ Ошибка API: {err}\nПроверьте ключи.", "en": "❌ API error: {err}\nCheck your keys."},
+#     "api_disc_ok":  {"ru": "✅ API отключён.", "en": "✅ API disconnected."},
+#     "api_no_plan":  {"ru": "🔒 Авто-торговля доступна только в Pro и VIP.", "en": "🔒 Auto-trading is available in Pro and VIP only."},
+#     "tr_cancel":    {"ru": "❌ Сделка отменена.", "en": "❌ Trade cancelled."},
+#     "tr_err":       {"ru": "❌ Ошибка сделки: {err}", "en": "❌ Trade error: {err}"},
+#     "help": {
+#         "ru": (
+#             "ℹ️ <b>Помощь — Apex Trading Bot</b>\n\n"
+#             "/start — Главное меню\n"
+#             "/signal — Сигнал\n"
+#             "/subscribe — Подписка\n"
+#             "/profile — Профиль\n"
+#             "/api — BingX API\n"
+#             "/setlimit N — Лимит сделок в день (VIP)\n\n"
+#             "<b>Оплата:</b> USDT TRC20 (TRON)"
+#         ),
+#         "en": (
+#             "ℹ️ <b>Help — Apex Trading Bot</b>\n\n"
+#             "/start — Main menu\n"
+#             "/signal — Signal\n"
+#             "/subscribe — Subscription\n"
+#             "/profile — Profile\n"
+#             "/api — BingX API\n"
+#             "/setlimit N — Daily trade limit (VIP)\n\n"
+#             "<b>Payment:</b> USDT TRC20 (TRON)"
+#         ),
+#     },
+#     "not_admin": {"ru": "⛔ Нет доступа.", "en": "⛔ Access denied."},
+#     "free_ok":   {"ru": "✅ VIP выдан @{u} на {d} дней.", "en": "✅ VIP granted to @{u} for {d} days."},
+#     "free_fail": {"ru": "❌ Пользователь не найден.", "en": "❌ User not found."},
+# }
+# # ── BingX API ──────────────────────────────────────────────────────────────────
+
+# async def bx_klines(symbol: str, interval: str = "15m", limit: int = 100) -> list:
+#     url = f"{BINGX_BASE}/openApi/swap/v2/quote/klines"
+#     async with httpx.AsyncClient(timeout=10) as c:
+#         r = await c.get(url, params={"symbol": symbol, "interval": interval, "limit": limit})
+#         d = r.json()
+#     if d.get("code") != 0:
+#         raise ValueError(d.get("msg", "BingX error"))
+#     return d.get("data", [])
+
+# async def bx_price(symbol: str) -> float:
+#     url = f"{BINGX_BASE}/openApi/swap/v2/quote/ticker"
+#     async with httpx.AsyncClient(timeout=10) as c:
+#         r = await c.get(url, params={"symbol": symbol})
+#         d = r.json()
+#     if d.get("code") != 0:
+#         raise ValueError(d.get("msg", "BingX error"))
+#     return float(d["data"]["lastPrice"])
+
+# async def bx_balance(api_key: str, secret: str) -> float:
+#     ts  = str(int(time.time() * 1000))
+#     q   = f"timestamp={ts}"
+#     sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+#     url = f"{BINGX_BASE}/openApi/swap/v2/user/balance"
+#     async with httpx.AsyncClient(timeout=10) as c:
+#         r = await c.get(url, params=f"{q}&signature={sig}", headers={"X-BX-APIKEY": api_key})
+#         d = r.json()
+#     if d.get("code") != 0:
+#         raise ValueError(d.get("msg", "BingX error"))
+#     return float(d["data"]["balance"].get("availableMargin", 0))
+
+# async def bx_order(api_key: str, secret: str, symbol: str, side: str,
+#                    amount_usdt: float, sl: float, tp: float) -> dict:
+#     """VIP — вход + TP + SL"""
+#     ts = str(int(time.time() * 1000))
+#     params = {
+#         "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+#         "positionSide": side, "type": "MARKET",
+#         "quoteOrderQty": str(amount_usdt),
+#         "stopLoss": str(sl), "takeProfit": str(tp),
+#         "timestamp": ts,
+#     }
+#     q   = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+#     sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+#     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+#     async with httpx.AsyncClient(timeout=15) as c:
+#         r = await c.post(url, params=f"{q}&signature={sig}", headers={"X-BX-APIKEY": api_key})
+#         d = r.json()
+#     if d.get("code") != 0:
+#         raise ValueError(d.get("msg", "Order error"))
+#     return d.get("data", {})
+
+# async def bx_order_entry_only(api_key: str, secret: str, symbol: str,
+#                                side: str, amount_usdt: float) -> dict:
+#     """Pro — только вход, без TP и SL"""
+#     ts = str(int(time.time() * 1000))
+#     params = {
+#         "symbol": symbol, "side": "BUY" if side == "LONG" else "SELL",
+#         "positionSide": side, "type": "MARKET",
+#         "quoteOrderQty": str(amount_usdt),
+#         "timestamp": ts,
+#     }
+#     q   = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+#     sig = hmac.new(secret.encode(), q.encode(), hashlib.sha256).hexdigest()
+#     url = f"{BINGX_BASE}/openApi/swap/v2/trade/order"
+#     async with httpx.AsyncClient(timeout=15) as c:
+#         r = await c.post(url, params=f"{q}&signature={sig}", headers={"X-BX-APIKEY": api_key})
+#         d = r.json()
+#     if d.get("code") != 0:
+#         raise ValueError(d.get("msg", "Order error"))
+#     return d.get("data", {})
+
+# # ── Технический анализ ─────────────────────────────────────────────────────────
+
+# def _ema(vals: list, p: int) -> list:
+#     out, k = [], 2 / (p + 1)
+#     for i, v in enumerate(vals):
+#         if i < p - 1:    out.append(None)
+#         elif i == p - 1: out.append(sum(vals[:p]) / p)
+#         else:            out.append(v * k + out[-1] * (1 - k))
+#     return out
+
+# def _rsi(vals: list, p: int = 14) -> float | None:
+#     if len(vals) < p + 1: return None
+#     gains  = [max(vals[i] - vals[i-1], 0) for i in range(1, len(vals))]
+#     losses = [max(vals[i-1] - vals[i], 0) for i in range(1, len(vals))]
+#     ag, al = sum(gains[-p:]) / p, sum(losses[-p:]) / p
+#     return 100.0 if al == 0 else 100 - 100 / (1 + ag / al)
+
+# def _atr(klines: list, p: int = 14) -> float:
+#     trs = [max(float(k["high"]) - float(k["low"]),
+#                abs(float(k["high"]) - float(klines[i-1]["close"])),
+#                abs(float(k["low"])  - float(klines[i-1]["close"])))
+#            for i, k in enumerate(klines) if i > 0]
+#     if not trs: return 0
+#     return sum(trs[-p:]) / min(len(trs), p)
+
+# def _dec(price: float) -> int:
+#     if price >= 1000: return 2
+#     if price >= 10:   return 3
+#     if price >= 1:    return 4
+#     return 6
+
+# async def generate_signal(symbol: str) -> dict:
+#     symbol = symbol.upper().replace("/", "-").replace("_", "-")
+#     if "-" not in symbol:
+#         symbol += "-USDT"
+#     k15, k1h = await asyncio.gather(bx_klines(symbol, "15m", 100), bx_klines(symbol, "1h", 60))
+#     c15 = [float(k["close"]) for k in k15]
+#     c1h = [float(k["close"]) for k in k1h]
+#     e20_15, e50_15 = _ema(c15, 20), _ema(c15, 50)
+#     e20_1h, e50_1h = _ema(c1h, 20), _ema(c1h, 50)
+#     rsi15          = _rsi(c15)
+#     atr_val        = _atr(k15)
+#     price          = float(k15[-1]["close"])
+#     vols           = [float(k["volume"]) for k in k15]
+#     vol_surge      = vols[-1] > sum(vols[-20:]) / 20 * 1.5
+#     score = 0
+#     reasons_ru, reasons_en = [], []
+#     if e20_15[-1] and e50_15[-1]:
+#         if e20_15[-1] > e50_15[-1]:
+#             score += 2; reasons_ru.append("EMA20>EMA50 (15м бычий)"); reasons_en.append("EMA20>EMA50 (15m bullish)")
+#         else:
+#             score -= 2; reasons_ru.append("EMA20<EMA50 (15м медвежий)"); reasons_en.append("EMA20<EMA50 (15m bearish)")
+#     if e20_1h[-1] and e50_1h[-1]:
+#         if e20_1h[-1] > e50_1h[-1]:
+#             score += 3; reasons_ru.append("1ч тренд восходящий"); reasons_en.append("1h trend bullish")
+#         else:
+#             score -= 3; reasons_ru.append("1ч тренд нисходящий"); reasons_en.append("1h trend bearish")
+#     if rsi15 is not None:
+#         if rsi15 < 35:
+#             score += 2; reasons_ru.append(f"RSI {rsi15:.0f} — перепроданность"); reasons_en.append(f"RSI {rsi15:.0f} — oversold")
+#         elif rsi15 > 65:
+#             score -= 2; reasons_ru.append(f"RSI {rsi15:.0f} — перекупленность"); reasons_en.append(f"RSI {rsi15:.0f} — overbought")
+#         else:
+#             reasons_ru.append(f"RSI {rsi15:.0f} — нейтрально"); reasons_en.append(f"RSI {rsi15:.0f} — neutral")
+#     if vol_surge:
+#         reasons_ru.append("Объём выше среднего"); reasons_en.append("Volume above avg")
+#     side = "LONG" if score >= 0 else "SHORT"
+#     dec  = _dec(price)
+#     if side == "LONG":
+#         sl  = round(price - atr_val * 1.5, dec)
+#         tp1 = round(price + atr_val * 2.0, dec)
+#         tp2 = round(price + atr_val * 3.5, dec)
+#     else:
+#         sl  = round(price + atr_val * 1.5, dec)
+#         tp1 = round(price - atr_val * 2.0, dec)
+#         tp2 = round(price - atr_val * 3.5, dec)
+#     entry_lo = round(price * 0.998, dec)
+#     entry_hi = round(price * 1.002, dec)
+#     conf     = min(95, max(30, 30 + abs(score) * 10))
+#     return {
+#         "symbol": symbol, "side": side, "price": price,
+#         "entry_lo": entry_lo, "entry_hi": entry_hi,
+#         "tp1": tp1, "tp2": tp2, "sl": sl,
+#         "atr": round(atr_val, dec),
+#         "rsi": round(rsi15, 1) if rsi15 else None,
+#         "conf": conf,
+#         "reason_ru": " · ".join(reasons_ru[:3]),
+#         "reason_en": " · ".join(reasons_en[:3]),
+#     }
+
+# def signal_text(lang: str, s: dict) -> str:
+#     side_ru = "🟢 LONG (Покупка)" if s["side"] == "LONG" else "🔴 SHORT (Продажа)"
+#     side_en = "🟢 LONG (Buy)"     if s["side"] == "LONG" else "🔴 SHORT (Sell)"
+#     rsi = str(s["rsi"]) if s["rsi"] else "N/A"
+#     if lang == "ru":
+#         return (
+#             f"📊 <b>Сигнал: {s['symbol']}</b>\n"
+#             f"━━━━━━━━━━━━━━━━━━━━\n"
+#             f"📍 <b>Направление:</b> {side_ru}\n"
+#             f"💰 <b>Текущая цена:</b> {s['price']} USDT\n"
+#             f"🎯 <b>Зона входа:</b> {s['entry_lo']} — {s['entry_hi']}\n"
+#             f"🛑 <b>Stop-Loss:</b> {s['sl']}\n"
+#             f"✅ <b>TP1:</b> {s['tp1']}\n"
+#             f"🏆 <b>TP2:</b> {s['tp2']}\n"
+#             f"📈 <b>ATR:</b> {s['atr']}  |  <b>RSI:</b> {rsi}\n"
+#             f"🔥 <b>Уверенность:</b> {s['conf']}%\n"
+#             f"━━━━━━━━━━━━━━━━━━━━\n"
+#             f"💡 {s['reason_ru']}\n\n"
+#             f"⚠️ <i>Не является финансовым советом.</i>"
+#         )
+#     return (
+#         f"📊 <b>Signal: {s['symbol']}</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"📍 <b>Direction:</b> {side_en}\n"
+#         f"💰 <b>Current Price:</b> {s['price']} USDT\n"
+#         f"🎯 <b>Entry Zone:</b> {s['entry_lo']} — {s['entry_hi']}\n"
+#         f"🛑 <b>Stop-Loss:</b> {s['sl']}\n"
+#         f"✅ <b>TP1:</b> {s['tp1']}\n"
+#         f"🏆 <b>TP2:</b> {s['tp2']}\n"
+#         f"📈 <b>ATR:</b> {s['atr']}  |  <b>RSI:</b> {rsi}\n"
+#         f"🔥 <b>Confidence:</b> {s['conf']}%\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"💡 {s['reason_en']}\n\n"
+#         f"⚠️ <i>Not financial advice.</i>"
+#     )
+
+# # ── Tron верификация ───────────────────────────────────────────────────────────
+
+# async def verify_tx(tx_hash: str, expected_usdt: float) -> dict:
+#     err = lambda msg: {"ok": False, "error": msg, "amount": 0}
+#     try:
+#         async with httpx.AsyncClient(timeout=15) as c:
+#             r = await c.get(f"{TRONSCAN_API}/transaction-info", params={"hash": tx_hash.strip()})
+#             d = r.json()
+#     except Exception as e:
+#         return err(f"Ошибка сети: {e}")
+#     if not d or d.get("retCode") == 1:
+#         return err("Транзакция не найдена")
+#     if d.get("confirmations", 0) < 10:
+#         return err(f"Мало подтверждений: {d.get('confirmations', 0)}/10")
+#     amount = 0.0
+#     for t in d.get("trc20TransferInfo", []):
+#         if (t.get("contract_address", "").upper() == USDT_CONTRACT.upper()
+#                 or t.get("symbol") == "USDT") \
+#                 and t.get("to_address", "").upper() == WALLET_ADDRESS.upper():
+#             amount = int(t.get("amount_str", t.get("amount", "0"))) / 1_000_000
+#             break
+#     if amount == 0:
+#         return err(f"Перевод USDT на кошелёк {WALLET_ADDRESS[:10]}... не найден")
+#     if amount < expected_usdt * 0.98:
+#         return err(f"Сумма {amount:.2f} USDT < ожидаемой {expected_usdt} USDT")
+#     return {"ok": True, "error": None, "amount": amount}
+
+# # ── Утилиты ────────────────────────────────────────────────────────────────────
+
+# def fmt_date(ts: int) -> str:
+#     if not ts: return "—"
+#     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y")
+
+# def is_admin(uid: int) -> bool:
+#     return uid == ADMIN_ID
+
+# async def lang(uid: int) -> str:
+#     return await db.get_language(uid)
+
+# async def show_menu(message: Message, uid: int, edit: bool = False):
+#     l = await lang(uid)
+#     txt, kb = T(l, "menu"), kb_menu(l)
+#     if edit:
+#         try:   await message.edit_text(txt, reply_markup=kb)
+#         except Exception: await message.answer(txt, reply_markup=kb)
+#     else:
+#         await message.answer(txt, reply_markup=kb)
+
+# # ── Хендлеры — старт, меню, профиль ───────────────────────────────────────────
+
+# @router.message(CommandStart())
+# async def h_start(message: Message, state: FSMContext):
+#     await state.clear()
+#     uid = message.from_user.id
+#     await db.upsert_user(uid, message.from_user.username, message.from_user.first_name)
+#     l = await lang(uid)
+#     await message.answer(T(l, "welcome", name=message.from_user.first_name or "Trader"),
+#                          reply_markup=kb_lang())
+
+# @router.callback_query(F.data.startswith("lang:"))
+# async def h_lang(call: CallbackQuery):
+#     l = call.data.split(":")[1]
+#     await db.set_language(call.from_user.id, l)
+#     await call.message.edit_text("✅ <b>Русский</b>" if l == "ru" else "✅ <b>English</b>")
+#     await asyncio.sleep(0.3)
+#     await show_menu(call.message, call.from_user.id, edit=True)
+
+# @router.message(Command("menu"))
+# async def h_menu_cmd(message: Message, state: FSMContext):
+#     await state.clear()
+#     await show_menu(message, message.from_user.id)
+
+# @router.callback_query(F.data == "m:back")
+# async def h_back(call: CallbackQuery, state: FSMContext):
+#     await state.clear()
+#     await show_menu(call.message, call.from_user.id, edit=True)
+
+# @router.message(Command("profile"))
+# async def h_profile_cmd(message: Message):
+#     await _send_profile(message, message.from_user.id)
+
+# @router.callback_query(F.data == "m:profile")
+# async def h_profile_cb(call: CallbackQuery):
+#     await _send_profile(call.message, call.from_user.id, edit=True)
+
+# async def _send_profile(message: Message, uid: int, edit: bool = False):
+#     l = await lang(uid)
+#     user = await db.get_user(uid)
+#     plan, exp = await db.get_subscription(uid)
+#     api_ok = user and user["bingx_connected"]
+#     name   = (user and user.get("first_name")) or "Trader"
+#     tl     = await db.get_trade_limit(uid) if plan == "vip" else None
+#     tl_txt = ("безлимит" if tl == 0 else str(tl)) if plan == "vip" and l == "ru" else \
+#              ("unlimited" if tl == 0 else str(tl)) if plan == "vip" else None
+#     if l == "ru":
+#         plan_t = f"{PLANS[plan]['emoji']} {plan.upper()}" if plan else "❌ Нет подписки"
+#         api_t  = "🟢 Подключён" if api_ok else "🔴 Не подключён"
+#     else:
+#         plan_t = f"{PLANS[plan]['emoji']} {plan.upper()}" if plan else "❌ No subscription"
+#         api_t  = "🟢 Connected" if api_ok else "🔴 Not connected"
+#     text = (
+#         f"👤 <b>{'Профиль' if l == 'ru' else 'Profile'}</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"🆔 ID: <code>{uid}</code>\n"
+#         f"📛 {'Имя' if l == 'ru' else 'Name'}: {name}\n"
+#         f"💎 {'Подписка' if l == 'ru' else 'Subscription'}: <b>{plan_t}</b>\n"
+#         f"📅 {'Действует до' if l == 'ru' else 'Valid until'}: {fmt_date(exp) if plan else '—'}\n"
+#         f"🤖 BingX API: {api_t}\n"
+#         f"📊 {'Сигналов сегодня' if l == 'ru' else 'Signals today'}: {user['signals_today'] if user else 0}\n"
+#         + (f"📡 {'Лимит сделок/день' if l == 'ru' else 'Trade limit/day'}: <b>{tl_txt}</b>\n" if tl_txt is not None else "")
+#         + f"━━━━━━━━━━━━━━━━━━━━"
+#     )
+#     kb = kb_back(l)
+#     if edit:
+#         try:   await message.edit_text(text, reply_markup=kb)
+#         except Exception: await message.answer(text, reply_markup=kb)
+#     else:
+#         await message.answer(text, reply_markup=kb)
+
+# # ── Хендлеры — подписка и оплата ──────────────────────────────────────────────
+
+# @router.message(Command("subscribe"))
+# async def h_sub_cmd(message: Message, state: FSMContext):
+#     await state.clear()
+#     l = await lang(message.from_user.id)
+#     await message.answer(T(l, "plans"), reply_markup=kb_plans(l))
+
+# @router.callback_query(F.data == "m:sub")
+# async def h_sub_cb(call: CallbackQuery, state: FSMContext):
+#     await state.clear()
+#     l = await lang(call.from_user.id)
+#     await call.message.edit_text(T(l, "plans"), reply_markup=kb_plans(l))
+
+# @router.callback_query(F.data.startswith("plan:"))
+# async def h_plan(call: CallbackQuery):
+#     plan = call.data.split(":")[1]
+#     l    = await lang(call.from_user.id)
+#     await call.message.edit_text(T(l, f"plan_{plan}"), reply_markup=kb_plan_buy(plan, l))
+
+# @router.callback_query(F.data.startswith("buy:"))
+# async def h_buy(call: CallbackQuery, state: FSMContext):
+#     plan  = call.data.split(":")[1]
+#     l     = await lang(call.from_user.id)
+#     price = PLANS[plan]["price"]
+#     await state.update_data(plan=plan, price=price)
+#     await call.message.edit_text(
+#         T(l, "payment", plan=PLANS[plan]["name"], price=price, wallet=WALLET_ADDRESS),
+#         reply_markup=kb_paid(l))
+
+# @router.callback_query(F.data == "pay:check")
+# async def h_pay_check(call: CallbackQuery, state: FSMContext):
+#     data = await state.get_data()
+#     if not data.get("plan"):
+#         await call.answer("Сначала выберите тариф!", show_alert=True); return
+#     l = await lang(call.from_user.id)
+#     await state.set_state(PayFSM.waiting_tx)
+#     await call.message.edit_text(T(l, "enter_tx"), reply_markup=kb_back(l))
+
+# @router.message(PayFSM.waiting_tx)
+# async def h_tx(message: Message, state: FSMContext):
+#     uid   = message.from_user.id
+#     l     = await lang(uid)
+#     tx    = message.text.strip()
+#     data  = await state.get_data()
+#     plan  = data.get("plan", "basic")
+#     price = data.get("price", PLANS[plan]["price"])
+#     if await db.get_payment_by_hash(tx):
+#         await message.answer(T(l, "tx_dup"), reply_markup=kb_back(l))
+#         await state.clear(); return
+#     msg = await message.answer(T(l, "verifying"))
+#     await db.create_payment(uid, plan, price, tx)
+#     result = await verify_tx(tx, price)
+#     if result["ok"]:
+#         await db.activate_subscription(uid, plan, PLANS[plan]["days"])
+#         await db.update_payment_status(tx, "verified")
+#         await state.clear()
+#         exp = int(time.time()) + PLANS[plan]["days"] * 86400
+#         await msg.edit_text(
+#             T(l, "pay_ok", plan=PLANS[plan]["name"], amount=result["amount"], exp=fmt_date(exp)),
+#             reply_markup=kb_back(l))
+#         user  = await db.get_user(uid)
+#         uname = f"@{user['username']}" if user and user.get("username") else f"ID:{uid}"
+#         await bot.send_message(ADMIN_ID,
+#             f"🆕 <b>Новая подписка!</b>\n👤 {uname}\n💎 {plan.upper()}\n"
+#             f"💰 {result['amount']} USDT\n🔗 <code>{tx}</code>")
+#     else:
+#         await db.update_payment_status(tx, "failed")
+#         await msg.edit_text(T(l, "pay_fail", err=result["error"]), reply_markup=kb_back(l))
+#         await state.clear()
+
+# # ── Хендлеры — сигналы ────────────────────────────────────────────────────────
+
+# @router.message(Command("signal"))
+# async def h_signal_cmd(message: Message, state: FSMContext):
+#     await state.clear()
+#     uid   = message.from_user.id
+#     l     = await lang(uid)
+#     parts = message.text.split()
+#     if len(parts) > 1:
+#         await _do_signal(message, uid, l, parts[1], state)
+#     else:
+#         await message.answer(T(l, "sig_menu"), reply_markup=kb_pairs(l))
+
+# @router.callback_query(F.data == "m:signal")
+# async def h_signal_cb(call: CallbackQuery, state: FSMContext):
+#     await state.clear()
+#     l = await lang(call.from_user.id)
+#     await call.message.edit_text(T(l, "sig_menu"), reply_markup=kb_pairs(l))
+
+# @router.callback_query(F.data == "sig:custom")
+# async def h_sig_custom(call: CallbackQuery, state: FSMContext):
+#     l = await lang(call.from_user.id)
+#     await state.set_state(SignalFSM.waiting_pair)
+#     await call.message.edit_text(T(l, "enter_pair"), reply_markup=kb_back(l))
+
+# @router.message(SignalFSM.waiting_pair)
+# async def h_sig_pair(message: Message, state: FSMContext):
+#     uid = message.from_user.id
+#     l   = await lang(uid)
+#     await _do_signal(message, uid, l, message.text.strip(), state)
+
+# @router.callback_query(F.data.startswith("sig:") & ~F.data.eq("sig:custom"))
+# async def h_sig_select(call: CallbackQuery, state: FSMContext):
+#     symbol = call.data.split(":", 1)[1]
+#     uid    = call.from_user.id
+#     l      = await lang(uid)
+#     await call.message.edit_text(T(l, "loading_sig", symbol=symbol))
+#     await _do_signal(call.message, uid, l, symbol, state, edit=True)
+
+# async def _do_signal(message: Message, uid: int, l: str, symbol: str,
+#                      state: FSMContext, edit: bool = False):
+#     await state.clear()
+#     plan, _ = await db.get_subscription(uid)
+#     if not plan:
+#         kb = kb_back(l)
+#         if edit: await message.edit_text(T(l, "no_sub"), reply_markup=kb)
+#         else:    await message.answer(T(l, "no_sub"), reply_markup=kb)
+#         return
+#     if not await db.check_signal_quota(uid, PLANS[plan]["signal_limit"]):
+#         kb = kb_back(l)
+#         if edit: await message.edit_text(T(l, "sig_limit"), reply_markup=kb)
+#         else:    await message.answer(T(l, "sig_limit"), reply_markup=kb)
+#         return
+#     if not edit:
+#         load_msg = await message.answer(T(l, "loading_sig", symbol=symbol.upper()))
+#     else:
+#         load_msg = message
+#     try:
+#         sig = await generate_signal(symbol)
+#         await db.increment_signal_count(uid)
+#         await load_msg.edit_text(signal_text(l, sig), reply_markup=kb_back(l))
+#         if PLANS[plan]["auto_trade"]:
+#             user = await db.get_user(uid)
+#             if user and user["bingx_connected"]:
+#                 await _maybe_trade(uid, l, sig, plan)
+#     except Exception as e:
+#         logger.error(f"Signal error {symbol}: {e}")
+#         await load_msg.edit_text(T(l, "sig_error", symbol=symbol.upper()), reply_markup=kb_back(l))
+
+# # ── Авто-торговля ──────────────────────────────────────────────────────────────
+
+# async def _maybe_trade(uid: int, l: str, sig: dict, plan: str):
+#     api_key, secret = await db.get_api_keys(uid)
+#     if not api_key: return
+#     try:
+#         balance = await bx_balance(api_key, secret)
+#     except Exception: return
+#     amount = round(balance * 0.05, 2)
+#     if amount < 5: return
+
+#     if plan == "vip":
+#         if not await db.check_trade_quota(uid):
+#             limit = await db.get_trade_limit(uid)
+#             await bot.send_message(uid,
+#                 f"⚠️ {'Достигнут дневной лимит сделок' if l == 'ru' else 'Daily trade limit reached'}: "
+#                 f"<b>{limit}</b>\n"
+#                 f"{'Измените командой' if l == 'ru' else 'Change with'} /setlimit")
+#             return
+
+#     trade_id = await db.create_trade(uid, sig["symbol"], sig["side"],
+#                                      sig["price"], sig["sl"], sig["tp1"], sig["tp2"], amount)
+#     if plan == "pro":
+#         await _exec_trade_entry_only(uid, l, trade_id, sig, api_key, secret, amount)
+#     else:
+#         await _exec_trade(uid, l, trade_id, sig, api_key, secret, amount)
+
+# async def _exec_trade(uid: int, l: str, trade_id: int, sig: dict,
+#                       api_key: str, secret: str, amount: float):
+#     """VIP — полный авто с TP/SL"""
+#     try:
+#         order = await bx_order(api_key, secret, sig["symbol"], sig["side"],
+#                                amount, sig["sl"], sig["tp1"])
+#         oid = order.get("order", {}).get("orderId", "N/A")
+#         await db.update_trade(trade_id, str(oid), "open")
+#         await db.increment_trade_count(uid)
+#         await bot.send_message(uid,
+#             f"✅ {'Сделка открыта (VIP)' if l == 'ru' else 'Trade opened (VIP)'}\n"
+#             f"{sig['symbol']} {sig['side']} | {amount} USDT\n"
+#             f"🛑 SL: {sig['sl']}  ✅ TP: {sig['tp1']}\n"
+#             f"🔑 {'Ордер' if l == 'ru' else 'Order'}: <code>{oid}</code>")
+#     except Exception as e:
+#         await db.update_trade(trade_id, "", "error")
+#         await bot.send_message(uid, T(l, "tr_err", err=str(e)[:120]))
+
+# async def _exec_trade_entry_only(uid: int, l: str, trade_id: int, sig: dict,
+#                                   api_key: str, secret: str, amount: float):
+#     """Pro — только вход, без TP/SL"""
+#     try:
+#         order = await bx_order_entry_only(api_key, secret, sig["symbol"], sig["side"], amount)
+#         oid = order.get("order", {}).get("orderId", "N/A")
+#         await db.update_trade(trade_id, str(oid), "open")
+#         await bot.send_message(uid,
+#             f"▶️ {'Вход выполнен (Pro)' if l == 'ru' else 'Entry executed (Pro)'}\n"
+#             f"{sig['symbol']} {sig['side']} | {amount} USDT\n"
+#             f"━━━━━━━━━━━━━━━━━━━━\n"
+#             f"⚠️ <b>{'Закройте сделку ВРУЧНУЮ!' if l == 'ru' else 'Close trade MANUALLY!'}</b>\n"
+#             f"🛑 SL: {sig['sl']}\n"
+#             f"✅ TP1: {sig['tp1']}  🏆 TP2: {sig['tp2']}\n"
+#             f"🔑 {'Ордер' if l == 'ru' else 'Order'}: <code>{oid}</code>")
+#     except Exception as e:
+#         await db.update_trade(trade_id, "", "error")
+#         await bot.send_message(uid, T(l, "tr_err", err=str(e)[:120]))
+
+# @router.callback_query(F.data.startswith("tr:no:"))
+# async def h_tr_cancel(call: CallbackQuery):
+#     trade_id = int(call.data.split(":")[2])
+#     l = await lang(call.from_user.id)
+#     await db.update_trade(trade_id, "", "cancelled")
+#     await call.message.edit_text(T(l, "tr_cancel"))
+#     # ── Хендлеры — API ────────────────────────────────────────────────────────────
+
+# @router.message(Command("api"))
+# async def h_api_cmd(message: Message):
+#     uid = message.from_user.id
+#     l   = await lang(uid)
+#     user = await db.get_user(uid)
+#     connected = user and user["bingx_connected"]
+#     plan, _ = await db.get_subscription(uid)
+#     if not plan or not PLANS.get(plan, {}).get("auto_trade"):
+#         await message.answer(T(l, "api_no_plan"), reply_markup=kb_back(l)); return
+#     txt = ("🤖 <b>Авто-торговля BingX</b>\n\n🟢 API подключён" if connected and l == "ru"
+#            else "🤖 <b>BingX Auto-Trading</b>\n\n🟢 API connected" if connected
+#            else "🤖 <b>Авто-торговля BingX</b>\n\n🔴 API не подключён" if l == "ru"
+#            else "🤖 <b>BingX Auto-Trading</b>\n\n🔴 API not connected")
+#     await message.answer(txt, reply_markup=kb_api(l, connected))
+
+# @router.callback_query(F.data == "m:auto")
+# async def h_auto_cb(call: CallbackQuery, state: FSMContext):
+#     await state.clear()
+#     uid = call.from_user.id
+#     l   = await lang(uid)
+#     plan, _ = await db.get_subscription(uid)
+#     if not plan or not PLANS.get(plan, {}).get("auto_trade"):
+#         await call.message.edit_text(T(l, "api_no_plan"), reply_markup=kb_back(l)); return
+#     user = await db.get_user(uid)
+#     connected = user and user["bingx_connected"]
+#     txt = ("🤖 <b>Авто-торговля BingX</b>\n\n🟢 API подключён" if connected and l == "ru"
+#            else "🤖 <b>BingX Auto-Trading</b>\n\n🟢 API connected" if connected
+#            else "🤖 <b>Авто-торговля BingX</b>\n\n🔴 API не подключён" if l == "ru"
+#            else "🤖 <b>BingX Auto-Trading</b>\n\n🔴 API not connected")
+#     await call.message.edit_text(txt, reply_markup=kb_api(l, connected))
+
+# @router.callback_query(F.data == "api:connect")
+# async def h_api_connect(call: CallbackQuery, state: FSMContext):
+#     l = await lang(call.from_user.id)
+#     await state.set_state(ApiFSM.waiting_key)
+#     await call.message.edit_text(T(l, "api_intro"), reply_markup=kb_back(l))
+
+# @router.message(ApiFSM.waiting_key)
+# async def h_api_key(message: Message, state: FSMContext):
+#     await state.update_data(api_key=message.text.strip())
+#     await message.delete()
+#     l = await lang(message.from_user.id)
+#     await state.set_state(ApiFSM.waiting_secret)
+#     await message.answer(T(l, "enter_secret"), reply_markup=kb_back(l))
+
+# @router.message(ApiFSM.waiting_secret)
+# async def h_api_secret(message: Message, state: FSMContext):
+#     uid = message.from_user.id
+#     l   = await lang(uid)
+#     data = await state.get_data()
+#     api_key = data.get("api_key", "")
+#     secret  = message.text.strip()
+#     await message.delete()
+#     try:
+#         bal = await bx_balance(api_key, secret)
+#         await db.save_api_keys(uid, api_key, secret)
+#         await state.clear()
+#         await message.answer(T(l, "api_ok", bal=bal), reply_markup=kb_back(l))
+#     except Exception as e:
+#         await state.clear()
+#         await message.answer(T(l, "api_err", err=str(e)[:100]), reply_markup=kb_back(l))
+
+# @router.callback_query(F.data == "api:disc")
+# async def h_api_disc(call: CallbackQuery):
+#     l = await lang(call.from_user.id)
+#     await db.remove_api_keys(call.from_user.id)
+#     await call.message.edit_text(T(l, "api_disc_ok"), reply_markup=kb_back(l))
+
+# @router.callback_query(F.data == "api:balance")
+# async def h_api_balance(call: CallbackQuery):
+#     uid = call.from_user.id
+#     l   = await lang(uid)
+#     api_key, secret = await db.get_api_keys(uid)
+#     if not api_key:
+#         await call.answer("API not connected", show_alert=True); return
+#     try:
+#         bal  = await bx_balance(api_key, secret)
+#         user = await db.get_user(uid)
+#         connected = user and user["bingx_connected"]
+#         txt  = f"💰 <b>{'Баланс' if l == 'ru' else 'Balance'} BingX: {bal:.2f} USDT</b>"
+#         await call.message.edit_text(txt, reply_markup=kb_api(l, connected))
+#     except Exception as e:
+#         await call.answer(f"Error: {e}", show_alert=True)
+
+# # ── Лимит сделок VIP ──────────────────────────────────────────────────────────
+
+# @router.message(Command("setlimit"))
+# async def h_setlimit(message: Message):
+#     uid = message.from_user.id
+#     l   = await lang(uid)
+#     plan, _ = await db.get_subscription(uid)
+#     if plan != "vip":
+#         await message.answer(
+#             "🔒 Команда /setlimit только для VIP.\n\nОформите VIP в разделе «Подписка»." if l == "ru"
+#             else "🔒 /setlimit is VIP only.\n\nGet VIP in the Subscription section.")
+#         return
+#     parts = message.text.split()
+#     if len(parts) < 2:
+#         cur = await db.get_trade_limit(uid)
+#         cur_text = ("безлимит" if cur == 0 else str(cur)) if l == "ru" else ("unlimited" if cur == 0 else str(cur))
+#         await message.answer(
+#             f"📊 <b>{'Лимит сделок в день' if l == 'ru' else 'Daily trade limit'}</b>\n"
+#             f"{'Текущий' if l == 'ru' else 'Current'}: <b>{cur_text}</b>\n\n"
+#             f"/setlimit 5 — {'макс 5 сделок/день' if l == 'ru' else 'max 5 trades/day'}\n"
+#             f"/setlimit 0 — {'безлимит' if l == 'ru' else 'unlimited'}")
+#         return
+#     try:
+#         limit = int(parts[1])
+#         if limit < 0: raise ValueError()
+#     except ValueError:
+#         await message.answer("❌ Введите число ≥ 0  (0 = безлимит)" if l == "ru"
+#                              else "❌ Enter number ≥ 0  (0 = unlimited)")
+#         return
+#     await db.set_trade_limit(uid, limit)
+#     txt = ("безлимит" if limit == 0 else f"{limit} сделок/день") if l == "ru" \
+#         else ("unlimited" if limit == 0 else f"{limit} trades/day")
+#     await message.answer(f"✅ {'Лимит установлен' if l == 'ru' else 'Limit set'}: <b>{txt}</b>")
+
+# # ── Помощь ────────────────────────────────────────────────────────────────────
+
+# @router.message(Command("help"))
+# async def h_help_cmd(message: Message):
+#     l = await lang(message.from_user.id)
+#     await message.answer(T(l, "help"), reply_markup=kb_back(l))
+
+# @router.callback_query(F.data == "m:help")
+# async def h_help_cb(call: CallbackQuery):
+#     l = await lang(call.from_user.id)
+#     await call.message.edit_text(T(l, "help"), reply_markup=kb_back(l))
+
+# # ── Админ-панель ──────────────────────────────────────────────────────────────
+
+# @router.message(Command("admin"))
+# async def h_admin(message: Message):
+#     if not is_admin(message.from_user.id):
+#         await message.answer(T("ru", "not_admin")); return
+#     stats = await db.get_stats()
+#     pc = stats["plans"]
+#     text = (
+#         f"🛡 <b>Apex Trading — Admin Panel</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"👥 Пользователей: <b>{stats['total']}</b>\n"
+#         f"✅ Активных: <b>{stats['active']}</b>\n"
+#         f"🥉 Basic: {pc.get('basic',0)}  🥈 Pro: {pc.get('pro',0)}  👑 VIP: {pc.get('vip',0)}\n"
+#         f"💰 Выручка: <b>{stats['revenue']:.2f} USDT</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━"
+#     )
+#     await message.answer(text, reply_markup=kb_admin())
+
+# @router.callback_query(F.data == "admin:report")
+# async def h_admin_report(call: CallbackQuery):
+#     if not is_admin(call.from_user.id):
+#         await call.answer("⛔ Нет доступа", show_alert=True); return
+#     stats = await db.get_stats()
+#     adv   = await db.get_advanced_stats()
+#     pc    = stats["plans"]
+#     now   = datetime.now(timezone.utc).strftime("%d.%m.%Y %H:%M UTC")
+#     text = (
+#         f"📋 <b>Полный отчёт</b>\n🕐 {now}\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"👥 Всего: <b>{stats['total']}</b>  Активных: <b>{stats['active']}</b>\n"
+#         f"🥉{pc.get('basic',0)} 🥈{pc.get('pro',0)} 👑{pc.get('vip',0)}\n\n"
+#         f"💰 Выручка: <b>{stats['revenue']:.2f} USDT</b>\n"
+#         f"Платежей: {adv['payments_total']} ✅{adv['payments_ok']} ❌{adv['payments_fail']}\n\n"
+#         f"📡 Сделок: {adv['trades_total']} ✅{adv['trades_open']} ❌{adv['trades_err']}\n"
+#         f"🤖 API: {adv['api_connected']}  📊 Сигналов сегодня: {adv['signals_today']}\n"
+#         f"━━━━━━━━━━━━━━━━━━━━"
+#     )
+#     b = InlineKeyboardBuilder()
+#     b.button(text="⬅️ Назад в панель", callback_data="admin:back")
+#     await call.message.edit_text(text, reply_markup=b.as_markup())
+
+# @router.callback_query(F.data == "admin:users")
+# async def h_admin_users(call: CallbackQuery):
+#     if not is_admin(call.from_user.id):
+#         await call.answer("⛔ Нет доступа", show_alert=True); return
+#     users = await db.get_recent_users(10)
+#     lines = [
+#         f"• {'@'+u['username'] if u.get('username') else 'ID:'+str(u['telegram_id'])} — {u.get('subscription') or '—'}"
+#         for u in users
+#     ]
+#     b = InlineKeyboardBuilder()
+#     b.button(text="⬅️ Назад в панель", callback_data="admin:back")
+#     await call.message.edit_text(
+#         f"👥 <b>Последние 10 пользователей</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+#         + ("\n".join(lines) if lines else "Нет пользователей"),
+#         reply_markup=b.as_markup())
+
+# @router.callback_query(F.data == "admin:payments")
+# async def h_admin_payments(call: CallbackQuery):
+#     if not is_admin(call.from_user.id):
+#         await call.answer("⛔ Нет доступа", show_alert=True); return
+#     payments = await db.get_recent_payments(10)
+#     lines = [
+#         f"{'✅' if p['status']=='verified' else '❌' if p['status']=='failed' else '⏳'} "
+#         f"{p['plan'].upper()} — {p['amount']} USDT  <code>{p['tx_hash'][:12]}…</code>"
+#         for p in payments
+#     ]
+#     b = InlineKeyboardBuilder()
+#     b.button(text="⬅️ Назад в панель", callback_data="admin:back")
+#     await call.message.edit_text(
+#         f"💰 <b>Последние 10 платежей</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+#         + ("\n".join(lines) if lines else "Платежей нет"),
+#         reply_markup=b.as_markup())
+
+# @router.callback_query(F.data == "admin:trades")
+# async def h_admin_trades(call: CallbackQuery):
+#     if not is_admin(call.from_user.id):
+#         await call.answer("⛔ Нет доступа", show_alert=True); return
+#     trades = await db.get_recent_trades(10)
+#     lines = [
+#         f"{'✅' if t['status']=='open' else '❌' if t['status']=='error' else '⏳'} "
+#         f"{t['symbol']} {t['side']} — {t['amount_usdt']} USDT"
+#         for t in trades
+#     ]
+#     b = InlineKeyboardBuilder()
+#     b.button(text="⬅️ Назад в панель", callback_data="admin:back")
+#     await call.message.edit_text(
+#         f"📡 <b>Последние 10 сделок</b>\n━━━━━━━━━━━━━━━━━━━━\n"
+#         + ("\n".join(lines) if lines else "Сделок нет"),
+#         reply_markup=b.as_markup())
+
+# @router.callback_query(F.data == "admin:back")
+# async def h_admin_back(call: CallbackQuery):
+#     if not is_admin(call.from_user.id):
+#         await call.answer("⛔ Нет доступа", show_alert=True); return
+#     stats = await db.get_stats()
+#     pc = stats["plans"]
+#     await call.message.edit_text(
+#         f"🛡 <b>Apex Trading — Admin Panel</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━\n"
+#         f"👥 Пользователей: <b>{stats['total']}</b>\n"
+#         f"✅ Активных: <b>{stats['active']}</b>\n"
+#         f"🥉{pc.get('basic',0)} 🥈{pc.get('pro',0)} 👑{pc.get('vip',0)}\n"
+#         f"💰 Выручка: <b>{stats['revenue']:.2f} USDT</b>\n"
+#         f"━━━━━━━━━━━━━━━━━━━━",
+#         reply_markup=kb_admin())
+
+# @router.message(Command("stats"))
+# async def h_stats(message: Message):
+#     if not is_admin(message.from_user.id):
+#         await message.answer(T("ru", "not_admin")); return
+#     stats = await db.get_stats()
+#     pc = stats["plans"]
+#     await message.answer(
+#         f"📊 <b>Статистика</b>\n"
+#         f"👥 Всего: {stats['total']} | Активных: {stats['active']}\n"
+#         f"🥉{pc.get('basic',0)} 🥈{pc.get('pro',0)} 👑{pc.get('vip',0)}\n"
+#         f"💰 Выручка: {stats['revenue']:.2f} USDT")
+
+# @router.message(Command("freeaccess"))
+# async def h_free(message: Message):
+#     if not is_admin(message.from_user.id): await message.answer(T("ru", "not_admin")); return
+#     parts = message.text.split()
+#     if len(parts) < 2: await message.answer("Использование: /freeaccess @username [дней]"); return
+#     uname = parts[1].lstrip("@")
+#     days  = int(parts[2]) if len(parts) > 2 else 30
+#     user  = await db.get_user_by_username(uname)
+#     if not user: await message.answer(T("ru", "free_fail")); return
+#     await db.activate_subscription(user["telegram_id"], "vip", days)
+#     await message.answer(T("ru", "free_ok", u=uname, d=days))
+#     l2 = await lang(user["telegram_id"])
+#     await bot.send_message(user["telegram_id"],
+#         f"🎁 {'Вам выдан бесплатный VIP на' if l2 == 'ru' else 'You received free VIP for'} "
+#         f"{days} {'дней!' if l2 == 'ru' else 'days!'}")
+
+# @router.message(Command("compensate"))
+# async def h_comp(message: Message):
+#     if not is_admin(message.from_user.id): await message.answer(T("ru", "not_admin")); return
+#     parts  = message.text.split(maxsplit=3)
+#     if len(parts) < 3: await message.answer("Использование: /compensate @user дней [причина]"); return
+#     uname  = parts[1].lstrip("@")
+#     days   = int(parts[2])
+#     reason = parts[3] if len(parts) > 3 else "Компенсация"
+#     user   = await db.get_user_by_username(uname)
+#     if not user: await message.answer("❌ Пользователь не найден"); return
+#     await db.activate_subscription(user["telegram_id"], user.get("subscription") or "vip", days)
+#     await message.answer(f"✅ @{uname} +{days} дней. Причина: {reason}")
+#     l2 = await lang(user["telegram_id"])
+#     await bot.send_message(user["telegram_id"],
+#         f"🎁 {'Компенсация' if l2 == 'ru' else 'Compensation'}: +{days} "
+#         f"{'дней VIP' if l2 == 'ru' else 'days VIP'}. "
+#         f"{'Причина' if l2 == 'ru' else 'Reason'}: {reason}")
+
+# @router.message(Command("broadcast"))
+# async def h_broadcast(message: Message):
+#     if not is_admin(message.from_user.id): await message.answer(T("ru", "not_admin")); return
+#     text = message.text.split(maxsplit=1)
+#     if len(text) < 2: await message.answer("Использование: /broadcast текст"); return
+#     msg_text = text[1]
+#     import aiosqlite as _sq
+#     async with _sq.connect(db.DATABASE_PATH) as dbc:
+#         dbc.row_factory = _sq.Row
+#         async with dbc.execute("SELECT telegram_id FROM users") as cur:
+#             users = await cur.fetchall()
+#     ok = fail = 0
+#     for u in users:
+#         try:
+#             await bot.send_message(u["telegram_id"], msg_text)
+#             ok += 1
+#         except Exception:
+#             fail += 1
+#         await asyncio.sleep(0.05)
+#     await message.answer(f"📢 Рассылка: ✅ {ok} | ❌ {fail}")
+
+
+# # ── Ежедневные VIP-отчёты ─────────────────────────────────────────────────────
+
+# async def daily_reports_task():
+#     while True:
+#         now = datetime.now(timezone.utc)
+#         if now.hour == 8 and now.minute == 0:
+#             vip_users = await db.get_vip_with_api()
+#             for u in vip_users:
+#                 try:
+#                     api_key, secret = await db.get_api_keys(u["telegram_id"])
+#                     if not api_key: continue
+#                     bal = await bx_balance(api_key, secret)
+#                     l2  = u.get("language", "ru")
+#                     await bot.send_message(u["telegram_id"],
+#                         f"📊 {'Ежедневный отчёт VIP' if l2 == 'ru' else 'VIP Daily Report'}\n"
+#                         f"💰 {'Баланс' if l2 == 'ru' else 'Balance'}: <b>{bal:.2f} USDT</b>\n"
+#                         f"📅 {now.strftime('%d.%m.%Y')}")
+#                 except Exception as e:
+#                     logger.error(f"Daily report {u['telegram_id']}: {e}")
+#             await asyncio.sleep(60)
+#         else:
+#             await asyncio.sleep(30)
+
+
+# # ── Запуск ────────────────────────────────────────────────────────────────────
+
+# async def on_startup():
+#     await db.init_db()
+#     await bot.set_my_commands([
+#         BotCommand(command="start",     description="🏠 Главное меню"),
+#         BotCommand(command="signal",    description="📊 Получить сигнал"),
+#         BotCommand(command="subscribe", description="💎 Подписка"),
+#         BotCommand(command="profile",   description="👤 Профиль"),
+#         BotCommand(command="api",       description="🤖 BingX API"),
+#         BotCommand(command="setlimit",  description="📡 Лимит сделок (VIP)"),
+#         BotCommand(command="help",      description="ℹ️ Помощь"),
+#     ])
+#     asyncio.create_task(daily_reports_task())
+#     logger.info("✅ Apex Trading Bot запущен!")
+#     try:
+#         await bot.send_message(ADMIN_ID, "🟢 <b>Apex Trading Bot запущен!</b>")
+#     except Exception:
+#         pass
+
+# async def main():
+#     dp.startup.register(on_startup)
+#     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+# if __name__ == "__main__":
+#     print("🚀 Apex Trading Terminal запущен успешно!")
+#     asyncio.run(main())
