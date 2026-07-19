@@ -1,3 +1,7 @@
+Бд 
+
+
+
 import aiosqlite
 import time
 from datetime import datetime, timezone
@@ -5,14 +9,27 @@ from cryptography.fernet import Fernet
 import os
 
 DATABASE_PATH  = os.environ.get("DATABASE_PATH", "apex_trading.db")
-ENCRYPTION_KEY = b"Yhq8azrWaoaC7tPY1hLuUbwBTFa0U8QCRE8oWwoVmR0="
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "Yhq8azrWaoaC7tPY1hLuUbwBTFa0U8QCRE8oWwoVmR0=").encode()
 fernet         = Fernet(ENCRYPTION_KEY)
 
 PLANS = {
-    "basic": {"name": "Basic", "emoji": "🥉", "price": 29,  "days": 30, "signal_limit": 5,    "auto_trade": False, "entry_only": False, "daily_report": False},
-    "pro":   {"name": "Pro",   "emoji": "🥈", "price": 69,  "days": 30, "signal_limit": 9999, "auto_trade": True,  "entry_only": True,  "daily_report": False},
-    "vip":   {"name": "VIP",   "emoji": "👑", "price": 129, "days": 30, "signal_limit": 9999, "auto_trade": True,  "entry_only": False, "daily_report": True},
+    "basic": {
+        "name": "Basic", "emoji": "🥉", "price": 29,  "days": 30,
+        "signal_limit": 5,    "auto_trade": False, "entry_only": False, "daily_report": False,
+    },
+    "pro": {
+        "name": "Pro",   "emoji": "🥈", "price": 69,  "days": 30,
+        "signal_limit": 9999, "auto_trade": True,  "entry_only": True,  "daily_report": False,
+    },
+    "vip": {
+        "name": "VIP",   "emoji": "👑", "price": 129, "days": 30,
+        "signal_limit": 9999, "auto_trade": True,  "entry_only": False, "daily_report": True,
+    },
 }
+
+TRADE_MIN_USDT = 5
+TRADE_MAX_USDT = 500
+TRADE_PCT      = 0.05
 
 async def init_db():
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -33,6 +50,7 @@ async def init_db():
                 trades_today INTEGER DEFAULT 0,
                 trades_date TEXT DEFAULT '',
                 daily_trade_limit INTEGER DEFAULT 0,
+                trade_amount_usdt REAL DEFAULT 0,
                 balance REAL DEFAULT 0,
                 created_at INTEGER DEFAULT 0
             );
@@ -72,7 +90,6 @@ async def init_db():
                 PRIMARY KEY (code, telegram_id)
             );
         """)
-        # Миграция: добавляем колонки если их нет (для старых баз)
         migrations = [
             "ALTER TABLE users ADD COLUMN language TEXT DEFAULT 'ru'",
             "ALTER TABLE users ADD COLUMN signals_today INTEGER DEFAULT 0",
@@ -80,6 +97,7 @@ async def init_db():
             "ALTER TABLE users ADD COLUMN trades_today INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN trades_date TEXT DEFAULT ''",
             "ALTER TABLE users ADD COLUMN daily_trade_limit INTEGER DEFAULT 0",
+            "ALTER TABLE users ADD COLUMN trade_amount_usdt REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0",
             "ALTER TABLE users ADD COLUMN bingx_connected INTEGER DEFAULT 0",
             "ALTER TABLE users ADD COLUMN api_key_enc BLOB DEFAULT NULL",
@@ -89,7 +107,7 @@ async def init_db():
             try:
                 await db.execute(sql)
             except Exception:
-                pass  # колонка уже есть
+                pass
         await db.commit()
 
 async def get_user(telegram_id: int):
@@ -102,7 +120,7 @@ async def get_user(telegram_id: int):
 async def get_user_by_username(username: str):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
-        async with db.execute("SELECT * FROM users WHERE username=?", (username,)) as cur:
+        async with db.execute("SELECT * FROM users WHERE username=?", (username.lstrip("@"),)) as cur:
             row = await cur.fetchone()
             return dict(row) if row else None
 
@@ -124,12 +142,12 @@ async def set_language(telegram_id: int, lang: str):
 
 async def get_language(telegram_id: int) -> str:
     user = await get_user(telegram_id)
-    return user["language"] if user else "ru"
+    return user["language"] if user and user.get("language") else "ru"
 
 async def activate_subscription(telegram_id: int, plan: str, days: int = 30):
     now = int(time.time())
     user = await get_user(telegram_id)
-    base = user["sub_expires"] if user and user["sub_expires"] > now else now
+    base = user["sub_expires"] if user and user["sub_expires"] and user["sub_expires"] > now else now
     new_exp = base + days * 86400
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
@@ -194,6 +212,16 @@ async def get_trade_limit(telegram_id: int) -> int:
     user = await get_user(telegram_id)
     return user.get("daily_trade_limit", 0) if user else 0
 
+async def set_trade_amount(telegram_id: int, amount: float):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute(
+            "UPDATE users SET trade_amount_usdt=? WHERE telegram_id=?", (amount, telegram_id))
+        await db.commit()
+
+async def get_trade_amount(telegram_id: int) -> float:
+    user = await get_user(telegram_id)
+    return user.get("trade_amount_usdt", 0) if user else 0
+
 async def save_api_keys(telegram_id: int, api_key: str, secret: str):
     enc_key = fernet.encrypt(api_key.encode())
     enc_sec = fernet.encrypt(secret.encode())
@@ -207,7 +235,11 @@ async def get_api_keys(telegram_id: int):
     user = await get_user(telegram_id)
     if not user or not user.get("api_key_enc"): return None, None
     try:
-        return fernet.decrypt(user["api_key_enc"]).decode(), fernet.decrypt(user["api_secret_enc"]).decode()
+        k = user["api_key_enc"]
+        s = user["api_secret_enc"]
+        if isinstance(k, str): k = k.encode()
+        if isinstance(s, str): s = s.encode()
+        return fernet.decrypt(k).decode(), fernet.decrypt(s).decode()
     except Exception:
         return None, None
 
@@ -267,9 +299,15 @@ async def update_trade(trade_id: int, order_id: str, status: str):
 async def create_promo(code: str, plan: str, days: int, max_uses: int = 1):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute(
-            "INSERT OR IGNORE INTO promos (code, plan, days, max_uses, used, created_at) VALUES (?,?,?,?,0,?)",
+            "INSERT OR REPLACE INTO promos (code, plan, days, max_uses, used, created_at) VALUES (?,?,?,?,0,?)",
             (code.upper(), plan, days, max_uses, int(time.time())))
         await db.commit()
+
+async def delete_promo(code: str) -> bool:
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cur = await db.execute("DELETE FROM promos WHERE code=?", (code.upper(),))
+        await db.commit()
+        return cur.rowcount > 0
 
 async def use_promo(code: str, telegram_id: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
@@ -277,7 +315,7 @@ async def use_promo(code: str, telegram_id: int):
         async with db.execute("SELECT * FROM promos WHERE code=?", (code.upper(),)) as cur:
             promo = await cur.fetchone()
         if not promo: return None, "Промокод не найден"
-        if promo["used"] >= promo["max_uses"]: return None, "Промокод уже использован"
+        if promo["used"] >= promo["max_uses"]: return None, "Промокод уже исчерпан"
         async with db.execute(
             "SELECT 1 FROM promo_uses WHERE code=? AND telegram_id=?",
             (code.upper(), telegram_id)) as cur:
