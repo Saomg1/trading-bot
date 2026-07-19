@@ -893,6 +893,32 @@ async def on_startup():
 async def main():
     dp.startup.register(on_startup)
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    # 1. Обработка нажатия кнопки "Промокоды" (покажет список или меню)
+@router.callback_query(lambda c: c.data == "admin:promos")
+async def admin_promos_menu(callback: CallbackQuery):
+    promos = await db.list_promos() # Функция list_promos у тебя есть в db.py
+    if not promos:
+        await callback.message.answer("Список промокодов пуст.")
+        return
+    
+    text = "🎟 **Активные промокоды:**\n\n"
+    for p in promos:
+        text += f"Код: `{p['code']}` | План: {p['plan']} | Использовано: {p['used']}/{p['max_uses']}\n"
+    await callback.message.answer(text, parse_mode="HTML")
+
+# 2. Обработка ввода промокода пользователем (через текст)
+# Допустим, пользователь пишет "ПРОМО: КОД"
+@router.message(lambda message: message.text.lower().startswith("промо:"))
+async def activate_promo_command(message: Message):
+    code = message.text.split(":")[1].strip()
+    promo, error = await db.use_promo(code, message.from_user.id)
+    
+    if error:
+        await message.answer(f"❌ Ошибка: {error}")
+    else:
+        # Активируем подписку (функция activate_subscription у тебя есть в db.py)
+        await db.activate_subscription(message.from_user.id, promo['plan'], promo['days'])
+        await message.answer(f"✅ Успешно! Подписка {promo['plan']} на {promo['days']} дней активирована.")
 
 if __name__ == "__main__":
     print("🚀 Apex Trading Terminal запущен!")
