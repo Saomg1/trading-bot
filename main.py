@@ -1466,7 +1466,33 @@ async def h_broadcast(message: Message):
             fail += 1
         await asyncio.sleep(0.05)
     await message.answer(f"📢 <b>Рассылка завершена</b>\n✅ {ok} · ❌ {fail}")
-    
+
+async def daily_reports_task():
+    while True:
+        now = datetime.now(timezone.utc)
+        if now.hour == 8 and now.minute == 0:
+            for u in await db.get_vip_with_api():
+                try:
+                    api_key, secret = await db.get_api_keys(u["telegram_id"])
+                    if not api_key: continue
+                    bal = await bx_balance(api_key, secret)
+                    tl  = u.get("daily_trade_limit", 0)
+                    ta  = u.get("trade_amount_usdt", 0)
+                    await bot.send_message(
+                        u["telegram_id"],
+                        f"📊 <b>VIP ОТЧЁТ · {now.strftime('%d.%m.%Y')}</b>\n"
+                        f"💰 Баланс BingX: <b>{bal:.2f} USDT</b>\n"
+                        f"📡 Лимит сделок: {'∞' if tl==0 else tl}\n"
+                        f"💵 Авто-сумма: {'5% баланса' if ta==0 else f'{ta} USDT'}\n"
+                        f"🤖 Режим: {'Подтверждение + авто-выход' if ta==0 else 'Полный автопилот'}\n"
+                        f"<i>Авто-торговля активна.</i>",
+                    )
+                except Exception as e:
+                    logger.error(f"Daily report {u['telegram_id']}: {e}")
+            await asyncio.sleep(60)
+        else:
+            await asyncio.sleep(30)
+
 async def on_startup():
     await db.init_db()
     await bot.set_my_commands([
