@@ -1537,29 +1537,31 @@ async def on_startup():
     try: await bot.send_message(ADMIN_ID, "🟢 <b>Apex Trading Bot запущен!</b>")
     except: pass
 
-async def main():
-    dp.startup.register(on_startup)
-    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
-    async def monitor_market_loop(bot):
-        logger.info("Мониторинг рынка запущен")
+
+   # 1. Функция мониторинга отдельно
+# 1. Функция мониторинга
+async def monitor_market_loop(bot):
+    logger.info("Мониторинг рынка запущен")
     while True:
         try:
-            # Здесь твоя логика проверки пар из БД
-            # Пример: symbols = await get_all_monitored_symbols()
-            # ... проверка через get_market_analysis ...
+            # Сюда вставь свою логику проверки БД
             pass 
         except Exception as e:
             logger.error(f"Ошибка в мониторинге: {e}")
         await asyncio.sleep(60)
 
+# 2. Функция main
 async def main():
-    # ... твой текущий код on_startup ...
+    # Регистрация startup
+    dp.startup.register(on_startup)
     
-    # ✅ ДОБАВЬ ЭТУ СТРОКУ:
+    # Запускаем мониторинг в фоне
     asyncio.create_task(monitor_market_loop(bot))
     
+    # Запускаем бота
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
+# 3. Точка входа
 if __name__ == "__main__":
     print("🚀 Apex Trading Bot запускается...")
-    asyncio.run(main())        
+    asyncio.run(main())
