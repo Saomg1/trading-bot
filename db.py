@@ -401,3 +401,15 @@ async def get_vip_with_api() -> list:
             "SELECT * FROM users WHERE subscription='vip' AND sub_expires>? AND bingx_connected=1",
             (now,)) as cur:
             return [dict(r) for r in await cur.fetchall()]
+async def add_recovery_alert(user_id: int, symbol: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("INSERT OR IGNORE INTO recovery_alerts (user_id, symbol) VALUES (?, ?)", (user_id, symbol.upper()))
+        await db.commit()
+
+async def get_users_for_recovery(symbol: str):
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        async with db.execute("SELECT user_id FROM recovery_alerts WHERE symbol=?", (symbol.upper(),)) as cursor:
+            rows = await cursor.fetchall()
+        await db.execute("DELETE FROM recovery_alerts WHERE symbol=?", (symbol.upper(),))
+        await db.commit()
+        return [r[0] for r in rows]

@@ -868,6 +868,31 @@ async def h_tx(message: Message, state: FSMContext):
         await db.update_payment_status(tx, "failed")
         await msg.edit_text(T(l, "pay_fail", err=result["error"]), reply_markup=kb_back(l))
         await state.clear()
+    async def _do_signal(message, uid, l, symbol, state, edit=False):
+    # 1. Анализируем рынок
+            market = await get_market_analysis(symbol)
+    
+    # 2. Если рынок «плохой»
+    if market.get('volatility', 0) < 0.5:
+        # Авто-подбор лучшей пары (можешь заменить на свою логику сортировки)
+        best_alternative = "BTC-USDT" 
+        reason = "высокий объем торгов и стабильная ликвидность"
+        
+        await add_recovery_alert(uid, symbol)
+        
+        text = (f"⚠️ Пара <b>{symbol.upper()}</b> сейчас нестабильна.\n\n"
+                f"💡 <b>Рекомендация:</b> прямо сейчас лучше торговать <b>{best_alternative}</b>, так как там {reason}.\n\n"
+                f"🔔 Мы пришлем уведомление, когда {symbol.upper()} восстановится.")
+        
+        # Отправляем уведомление
+        if edit: await message.edit_text(text, parse_mode="HTML")
+        else: await message.answer(text, parse_mode="HTML")
+        
+        # Переключаем пользователя на рекомендованную пару
+        await _do_signal(message, uid, l, best_alternative, state, edit=True)
+        return
+
+    # 3. Если рынок хороший — выполняем основной код сигнала...
 
 @router.message(Command("signal"))
 async def h_signal_cmd(message: Message, state: FSMContext):
@@ -1514,6 +1539,25 @@ async def on_startup():
 
 async def main():
     dp.startup.register(on_startup)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+    async def monitor_market_loop(bot):
+        logger.info("Мониторинг рынка запущен")
+    while True:
+        try:
+            # Здесь твоя логика проверки пар из БД
+            # Пример: symbols = await get_all_monitored_symbols()
+            # ... проверка через get_market_analysis ...
+            pass 
+        except Exception as e:
+            logger.error(f"Ошибка в мониторинге: {e}")
+        await asyncio.sleep(60)
+
+async def main():
+    # ... твой текущий код on_startup ...
+    
+    # ✅ ДОБАВЬ ЭТУ СТРОКУ:
+    asyncio.create_task(monitor_market_loop(bot))
+    
     await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 if __name__ == "__main__":
