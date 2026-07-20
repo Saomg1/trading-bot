@@ -54,6 +54,13 @@ class ApiFSM(StatesGroup):
 
 def is_admin(uid: int, uname: str = "") -> bool:
     return uid == ADMIN_ID or (uname and uname.lower() == ADMIN_USERNAME.lower())
+# Список модераторов — только рассылка
+MODERATOR_IDS = set(
+    int(x) for x in os.environ.get("MODERATOR_IDS", "").split(",") if x.strip()
+)
+
+def is_moderator(uid: int) -> bool:
+    return uid in MODERATOR_IDS
 
 def fmt_date(ts):
     return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%d.%m.%Y") if ts else "—"
@@ -1435,48 +1442,31 @@ async def h_comp(message: Message):
 
 @router.message(Command("broadcast"))
 async def h_broadcast(message: Message):
-    if not is_admin(message.from_user.id, message.from_user.username or ""):
-        await message.answer("⛔"); return
+    uid = message.from_user.id
+    # ✅ Доступ: главный админ ИЛИ модератор
+    if not is_admin(uid, message.from_user.username or "") and not is_moderator(uid):
+        await message.answer("⛔ Нет доступа."); return
+        
     text = message.text.split(maxsplit=1)
-    if len(text) < 2: await message.answer("/broadcast текст — рассылка всем"); return
+    if len(text) < 2:
+        await message.answer("/broadcast текст — рассылка всем"); return
+        
     import aiosqlite as _sq
     async with _sq.connect(db.DATABASE_PATH) as dbc:
         dbc.row_factory = _sq.Row
         async with dbc.execute("SELECT telegram_id FROM users") as cur:
             users = await cur.fetchall()
+            
     ok = fail = 0
     for u in users:
-        try:    await bot.send_message(u["telegram_id"], text[1]); ok+=1
-        except: fail+=1
+        try: 
+            await bot.send_message(u["telegram_id"], text[1])
+            ok += 1
+        except: 
+            fail += 1
         await asyncio.sleep(0.05)
     await message.answer(f"📢 <b>Рассылка завершена</b>\n✅ {ok} · ❌ {fail}")
-
-async def daily_reports_task():
-    while True:
-        now = datetime.now(timezone.utc)
-        if now.hour == 8 and now.minute == 0:
-            for u in await db.get_vip_with_api():
-                try:
-                    api_key, secret = await db.get_api_keys(u["telegram_id"])
-                    if not api_key: continue
-                    bal = await bx_balance(api_key, secret)
-                    tl  = u.get("daily_trade_limit", 0)
-                    ta  = u.get("trade_amount_usdt", 0)
-                    await bot.send_message(
-                        u["telegram_id"],
-                        f"📊 <b>VIP ОТЧЁТ · {now.strftime('%d.%m.%Y')}</b>\n{DIV}\n"
-                        f"💰 Баланс BingX: <b>{bal:.2f} USDT</b>\n"
-                        f"📡 Лимит сделок: {'∞' if tl==0 else tl}\n"
-                        f"💵 Авто-сумма: {'5% баланса' if ta==0 else f'{ta} USDT'}\n"
-                        f"🤖 Режим: {'Подтверждение + авто-выход' if ta==0 else 'Полный автопилот'}\n{DIV}\n"
-                        f"<i>Авто-торговля активна.</i>",
-                    )
-                except Exception as e:
-                    logger.error(f"Daily report {u['telegram_id']}: {e}")
-            await asyncio.sleep(60)
-        else:
-            await asyncio.sleep(30)
-
+    
 async def on_startup():
     await db.init_db()
     await bot.set_my_commands([

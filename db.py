@@ -300,22 +300,30 @@ async def create_promo(code: str, plan: str, days: int, max_uses: int = 1):
         await db.commit()
 
 async def delete_promo(code: str) -> bool:
+    # ✅ ИСПРАВЛЕНО: удаляем и из promos и из promo_uses
     async with aiosqlite.connect(DATABASE_PATH) as db:
         cur = await db.execute("DELETE FROM promos WHERE code=?", (code.upper(),))
+        await db.execute("DELETE FROM promo_uses WHERE code=?", (code.upper(),))
         await db.commit()
         return cur.rowcount > 0
 
 async def use_promo(code: str, telegram_id: int):
     async with aiosqlite.connect(DATABASE_PATH) as db:
         db.row_factory = aiosqlite.Row
+        # Проверяем существование промокода
         async with db.execute("SELECT * FROM promos WHERE code=?", (code.upper(),)) as cur:
             promo = await cur.fetchone()
-        if not promo: return None, "Промокод не найден"
-        if promo["used"] >= promo["max_uses"]: return None, "Промокод уже исчерпан"
+        if not promo:
+            return None, "Промокод не найден"
+        if promo["used"] >= promo["max_uses"]:
+            return None, "Промокод уже исчерпан"
+        # Проверяем, не использовал ли уже этот юзер
         async with db.execute(
             "SELECT 1 FROM promo_uses WHERE code=? AND telegram_id=?",
             (code.upper(), telegram_id)) as cur:
-            if await cur.fetchone(): return None, "Вы уже использовали этот промокод"
+            if await cur.fetchone():
+                return None, "Вы уже использовали этот промокод"
+        # Фиксируем использование
         await db.execute("INSERT INTO promo_uses VALUES (?,?)", (code.upper(), telegram_id))
         await db.execute("UPDATE promos SET used=used+1 WHERE code=?", (code.upper(),))
         await db.commit()
